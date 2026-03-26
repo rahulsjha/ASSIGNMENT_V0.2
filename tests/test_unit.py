@@ -8,6 +8,7 @@ from pathlib import Path
 from src.schema import SQLiteSchemaIntrospector
 from src.sql_validation import SQLValidator
 from src.llm_client import OpenRouterLLMClient
+from src.fallback_sql import generate_fallback_sql
 
 
 class SQLValidatorUnitTests(unittest.TestCase):
@@ -106,6 +107,25 @@ class LLMClientHelpersUnitTests(unittest.TestCase):
         self.assertEqual(client._stats["prompt_tokens"], 10)
         self.assertEqual(client._stats["completion_tokens"], 5)
         self.assertEqual(client._stats["total_tokens"], 15)
+
+
+class FallbackSQLUnitTests(unittest.TestCase):
+    def test_generates_top5_age_by_addiction(self) -> None:
+        sql = generate_fallback_sql(
+            "What are the top 5 age groups by average addiction level?",
+            table_name="gaming_mental_health",
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn("avg(addiction_level)", sql.lower())
+        self.assertIn("group by age", sql.lower())
+        self.assertIn("limit 5", sql.lower())
+
+    def test_zodiac_is_unanswerable(self) -> None:
+        sql = generate_fallback_sql(
+            "Which zodiac sign has the highest stress score?",
+            table_name="gaming_mental_health",
+        )
+        self.assertIsNone(sql)
 
 
 if __name__ == "__main__":

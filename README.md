@@ -1,7 +1,8 @@
 # Senior Full Stack Engineer (GenAI-Labs) Take-Home Assignment
 
-## Timebox
-Plan for **4-6 hours**.
+File for input: https://www.kaggle.com/datasets/sharmajicoder/gaming-and-mental-health?resource=download
+
+
 
 ## Goal
 Optimize a baseline LLM-driven analytics pipeline for a single-table SQL dataset while preserving output quality.

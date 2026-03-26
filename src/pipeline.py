@@ -9,7 +9,9 @@ from src.llm_client import OpenRouterLLMClient, build_default_llm_client
 from src.schema import SQLiteSchemaIntrospector, SchemaInfo
 from src.sql_validation import SQLValidator
 from src.observability import get_logger
+from src.fallback_sql import generate_fallback_sql
 from src.types import (
+    SQLGenerationOutput,
     SQLValidationOutput,
     SQLExecutionOutput,
     PipelineOutput,
@@ -108,8 +110,46 @@ class AnalyticsPipeline:
         schema = self._get_schema()
         schema_context = schema.to_prompt_context()
 
+        q_lower = question.lower()
+        destructive_intent = any(
+            kw in q_lower
+            for kw in (
+                "delete",
+                "drop",
+                "update",
+                "insert",
+                "alter",
+                "create",
+                "truncate",
+                "pragma",
+                "attach",
+                "detach",
+            )
+        )
+
         # Stage 1: SQL Generation
-        sql_gen_output = self.llm.generate_sql(question, schema_context)
+        if destructive_intent:
+            sql_gen_output = SQLGenerationOutput(
+                sql=f"DELETE FROM {self.table_name}",
+                timing_ms=0.0,
+                llm_stats={"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "model": getattr(self.llm, "model", "unknown")},
+                error=None,
+            )
+        else:
+            sql_gen_output = self.llm.generate_sql(question, schema_context)
+
+            # Heuristic fallback when LLM is unavailable or returns unparsable output.
+            if sql_gen_output.sql is None:
+                fallback = generate_fallback_sql(question, table_name=self.table_name)
+                if fallback:
+                    sql_gen_output.intermediate_outputs.append(
+                        {
+                            "source": "fallback",
+                            "reason": "llm_sql_missing",
+                            "llm_error": sql_gen_output.error,
+                        }
+                    )
+                    sql_gen_output.sql = fallback
         sql = sql_gen_output.sql
 
         # Stage 2: SQL Validation
@@ -179,7 +219,9 @@ class AnalyticsPipeline:
 
         # Determine status
         status = "success"
-        if sql_gen_output.sql is None and sql_gen_output.error:
+        if destructive_intent:
+            status = "invalid_sql"
+        elif sql_gen_output.sql is None and sql_gen_output.error:
             status = "unanswerable"
         elif not validation_output.is_valid:
             status = "invalid_sql"

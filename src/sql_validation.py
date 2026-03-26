@@ -41,6 +41,38 @@ def _normalize_sql(sql: str) -> str:
     return sql
 
 
+def _has_multiple_statements(sql: str) -> bool:
+    """Return True if SQL contains a statement separator outside of quotes.
+
+    Allows a single trailing semicolon (e.g. "SELECT 1;").
+    """
+    in_single = False
+    in_double = False
+    in_backtick = False
+    idxs: list[int] = []
+    for i, ch in enumerate(sql):
+        if ch == "'" and not in_double and not in_backtick:
+            # Toggle single-quote unless it's an escaped quote ('' inside string)
+            if in_single and i + 1 < len(sql) and sql[i + 1] == "'":
+                continue
+            in_single = not in_single
+        elif ch == '"' and not in_single and not in_backtick:
+            in_double = not in_double
+        elif ch == "`" and not in_single and not in_double:
+            in_backtick = not in_backtick
+        elif ch == ";" and not in_single and not in_double and not in_backtick:
+            idxs.append(i)
+
+    if not idxs:
+        return False
+    # If there's more than one separator, treat as multiple statements.
+    if len(idxs) > 1:
+        return True
+    # Single separator: allow only if it is trailing whitespace.
+    tail = sql[idxs[0] + 1 :].strip()
+    return tail != ""
+
+
 def _extract_cte_names(sql: str) -> set[str]:
     # Very small CTE name extractor: WITH name AS ( ... ), name2 AS (...)
     lower = sql.lower()
@@ -122,7 +154,7 @@ class SQLValidator:
             )
 
         # Reject multiple statements.
-        if ";" in normalized:
+        if _has_multiple_statements(normalized):
             return SQLValidationOutput(
                 is_valid=False,
                 validated_sql=None,

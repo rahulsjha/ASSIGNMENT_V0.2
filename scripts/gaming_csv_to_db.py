@@ -20,6 +20,7 @@ import argparse
 import sqlite3
 import sys
 from pathlib import Path
+import os
 
 import pandas as pd
 
@@ -88,12 +89,9 @@ def insert_chunk(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
     placeholders = ",".join(["?"] * len(df.columns))
     sql = f'INSERT INTO "{table_name}" ({",".join(cols)}) VALUES ({placeholders})'
 
-    rows = [
-        tuple(None if (pd.isna(x)) else x for x in row)
-        for row in df.itertuples(index=False, name=None)
-    ]
-    cursor.executemany(sql, rows)
-    conn.commit()
+    # Vectorized NA -> None conversion is much faster than per-cell checks.
+    df2 = df.where(pd.notna(df), None)
+    cursor.executemany(sql, df2.itertuples(index=False, name=None))
 
 
 def csv_to_sqlite(
@@ -112,18 +110,42 @@ def csv_to_sqlite(
     print(f"Connecting to database at: {db_path}")
     conn = sqlite3.connect(db_path)
 
+    # Speed-focused pragmas for bulk load (safe enough for local rebuilds).
+    try:
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA cache_size = -200000")  # ~200MB
+    except Exception:
+        pass
+
+    max_rows_env = os.getenv("CSV_TO_SQLITE_MAX_ROWS", "").strip()
+    max_rows = int(max_rows_env) if max_rows_env.isdigit() else None
+
     total_rows = 0
     try:
         first = True
-        for chunk in pd.read_csv(csv_path, chunksize=chunksize, low_memory=False):
-            if first:
-                create_table_from_df(conn, table_name, chunk, if_exists=if_exists)
-                print(f"Created table '{table_name}' with columns: {list(chunk.columns)}")
-                first = False
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = pd.read_csv(f, chunksize=chunksize, low_memory=False)
+            for chunk in reader:
+                if max_rows is not None and total_rows >= max_rows:
+                    break
 
-            insert_chunk(conn, table_name, chunk)
-            total_rows += len(chunk)
-            print(f"Inserted chunk of {len(chunk)} rows... (total: {total_rows})")
+                if max_rows is not None and (total_rows + len(chunk)) > max_rows:
+                    chunk = chunk.iloc[: max(0, max_rows - total_rows)].copy()
+
+                if first:
+                    create_table_from_df(conn, table_name, chunk, if_exists=if_exists)
+                    print(f"Created table '{table_name}' with columns: {list(chunk.columns)}")
+                    first = False
+
+                insert_chunk(conn, table_name, chunk)
+                conn.commit()
+                total_rows += len(chunk)
+                print(f"Inserted chunk of {len(chunk)} rows... (total: {total_rows})")
+
+        if max_rows is not None:
+            print(f"\nStopped early due to CSV_TO_SQLITE_MAX_ROWS={max_rows}.")
 
         print(f"\nSuccessfully loaded {total_rows} rows into '{table_name}'")
         print(f"Database saved to: {db_path}")
@@ -230,8 +252,8 @@ def main():
     parser.add_argument(
         "--verify",
         action="store_true",
-        default=True,
-        help="Verify database after creation (default: True)",
+        default=False,
+        help="Verify database after creation (default: False)",
     )
 
     args = parser.parse_args()

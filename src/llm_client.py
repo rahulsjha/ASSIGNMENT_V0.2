@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from src.types import SQLGenerationOutput, AnswerGenerationOutput
+from src.cache import LRUCache
 
 DEFAULT_MODEL = "openai/gpt-5-nano"
 
@@ -24,6 +25,11 @@ class OpenRouterLLMClient:
         self.model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         self._client = OpenRouter(api_key=api_key)
         self._stats = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        cache_size = int(os.getenv("LLM_CACHE_SIZE", "128") or "128")
+        cache_ttl = os.getenv("LLM_CACHE_TTL_SECONDS", "")
+        ttl = float(cache_ttl) if cache_ttl.strip() else None
+        self._sql_cache: LRUCache[str, str] = LRUCache(max_size=cache_size, ttl_seconds=ttl)
 
     def _update_usage_stats(self, res: Any) -> None:
         self._stats["llm_calls"] = int(self._stats.get("llm_calls", 0)) + 1
@@ -69,10 +75,50 @@ class OpenRouterLLMClient:
         choices = getattr(res, "choices", None) or []
         if not choices:
             raise RuntimeError("OpenRouter response contained no choices.")
-        content = getattr(getattr(choices[0], "message", None), "content", None)
-        if not isinstance(content, str):
+
+        choice0 = choices[0]
+        message = getattr(choice0, "message", None)
+        if message is None and isinstance(choice0, dict):
+            message = choice0.get("message")
+
+        content = None
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+
+        # Some providers/SDKs may return `text` directly on the choice.
+        if content is None:
+            if isinstance(choice0, dict):
+                content = choice0.get("text")
+            else:
+                content = getattr(choice0, "text", None)
+
+        def _coerce_to_text(value: Any) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value
+            if isinstance(value, dict):
+                # Common shapes: {"type":"text","text":"..."} or {"content":"..."}
+                for key in ("text", "content", "value"):
+                    v = value.get(key)
+                    if isinstance(v, str) and v.strip():
+                        return v
+                return None
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    t = _coerce_to_text(item)
+                    if t:
+                        parts.append(t)
+                return "".join(parts) if parts else None
+            return str(value)
+
+        text = _coerce_to_text(content)
+        if not isinstance(text, str) or not text.strip():
             raise RuntimeError("OpenRouter response content is not text.")
-        return content.strip()
+        return text.strip()
 
     @staticmethod
     def _extract_sql(text: str) -> str | None:
@@ -127,12 +173,29 @@ class OpenRouterLLMClient:
         sql = None
 
         try:
-            text = self._chat(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                temperature=0.0,
-                max_tokens=240,
+            # Cache by model + prompt contents (deterministic temperature=0).
+            cache_key = json.dumps(
+                {
+                    "model": self.model,
+                    "system": system_prompt,
+                    "user": user_prompt,
+                    "temperature": 0.0,
+                    "max_tokens": 240,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
             )
-            sql = self._extract_sql(text)
+            cached = self._sql_cache.get(cache_key)
+            if cached is not None:
+                sql = self._extract_sql(cached)
+            else:
+                text = self._chat(
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                    temperature=0.0,
+                    max_tokens=240,
+                )
+                self._sql_cache.set(cache_key, text)
+                sql = self._extract_sql(text)
         except Exception as exc:
             error = str(exc)
 

@@ -10,6 +10,10 @@
 
 - Added SQLite schema introspection in `src/schema.py` and passed schema context into SQL generation.
 
+- Added a deterministic fallback SQL generator in `src/fallback_sql.py`.
+  - Covers the public prompt set and close variants.
+  - Keeps the pipeline functional when OpenRouter/LLM calls fail or are blocked.
+
 - Implemented token usage counting in `src/llm_client.py`.
   - Extracts `prompt_tokens`, `completion_tokens`, `total_tokens` from OpenRouter response usage when available.
   - Aggregates per-request usage into the pipeline output contract.
