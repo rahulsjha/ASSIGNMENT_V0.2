@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 
 from src.llm_client import OpenRouterLLMClient, build_default_llm_client
+from src.schema import SQLiteSchemaIntrospector
+from src.sql_validation import SQLValidator
+from src.observability import get_logger
 from src.types import (
     SQLValidationOutput,
     SQLExecutionOutput,
@@ -14,39 +18,23 @@ from src.types import (
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = BASE_DIR / "data" / "gaming_mental_health.sqlite"
-
-
-class SQLValidationError(Exception):
-    pass
-
-
-class SQLValidator:
-    @classmethod
-    def validate(cls, sql: str | None) -> SQLValidationOutput:
-        start = time.perf_counter()
-
-        if sql is None:
-            return SQLValidationOutput(
-                is_valid=False,
-                validated_sql=None,
-                error="No SQL provided",
-                timing_ms=(time.perf_counter() - start) * 1000,
-            )
-
-        # TODO: Implement SQL validation logic
-        # Consider what validation is needed for this use case
-
-        return SQLValidationOutput(
-            is_valid=True,
-            validated_sql=sql,
-            error=None,
-            timing_ms=(time.perf_counter() - start) * 1000,
-        )
+DEFAULT_TABLE_NAME = "gaming_mental_health"
 
 
 class SQLiteExecutor:
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH, *, max_rows: int = 100) -> None:
         self.db_path = Path(db_path)
+        self.max_rows = max_rows
+
+    def _connect_readonly(self) -> sqlite3.Connection:
+        """Best-effort read-only connection.
+
+        Uses SQLite URI mode=ro when supported; falls back to regular connect.
+        """
+        try:
+            return sqlite3.connect(f"file:{self.db_path.as_posix()}?mode=ro", uri=True)
+        except Exception:
+            return sqlite3.connect(self.db_path)
 
     def run(self, sql: str | None) -> SQLExecutionOutput:
         start = time.perf_counter()
@@ -63,11 +51,15 @@ class SQLiteExecutor:
             )
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect_readonly() as conn:
+                try:
+                    conn.execute("PRAGMA query_only = ON")
+                except Exception:
+                    pass
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
                 cur.execute(sql)
-                rows = [dict(r) for r in cur.fetchmany(100)]
+                rows = [dict(r) for r in cur.fetchmany(self.max_rows)]
                 row_count = len(rows)
         except Exception as exc:
             error = str(exc)
@@ -83,22 +75,40 @@ class SQLiteExecutor:
 
 
 class AnalyticsPipeline:
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH, llm_client: OpenRouterLLMClient | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path = DEFAULT_DB_PATH,
+        llm_client: OpenRouterLLMClient | None = None,
+        *,
+        table_name: str = DEFAULT_TABLE_NAME,
+    ) -> None:
         self.db_path = Path(db_path)
+        self.table_name = table_name
         self.llm = llm_client or build_default_llm_client()
         self.executor = SQLiteExecutor(self.db_path)
+        self._logger = get_logger(__name__)
+        self._schema = SQLiteSchemaIntrospector(self.db_path, table_name=self.table_name).load()
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
         start = time.perf_counter()
+        request_id = request_id or uuid.uuid4().hex
+        self._logger.info("pipeline_start", extra={"request_id": request_id})
 
         # Stage 1: SQL Generation
-        sql_gen_output = self.llm.generate_sql(question, {})
+        sql_gen_output = self.llm.generate_sql(question, self._schema.to_prompt_context())
         sql = sql_gen_output.sql
 
         # Stage 2: SQL Validation
-        validation_output = SQLValidator.validate(sql)
+        validation_output = SQLValidator.validate(
+            sql,
+            db_path=self.db_path,
+            table_name=self.table_name,
+            allowed_columns=set(self._schema.columns),
+        )
         if not validation_output.is_valid:
             sql = None
+        else:
+            sql = validation_output.validated_sql
 
         # Stage 3: SQL Execution
         execution_output = self.executor.run(sql)
