@@ -1,14 +1,3 @@
-"""
-Consolidated Support Module
-
-Contains all supporting utilities:
-- Type definitions (types.py)
-- Observability/Logging (observability.py)
-- Fallback SQL generation (fallback_sql.py)
-- Intent detection for multi-turn (intent_detector.py)
-- Conversation context management (context_manager.py)
-"""
-
 from __future__ import annotations
 
 import json
@@ -21,63 +10,50 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 
-# ============ TYPE DEFINITIONS ============
 
 @dataclass
 class PipelineInput:
     question: str
     request_id: str | None = None
-    conversation_id: str | None = None  # Multi-turn: conversation context
-    use_context: bool = True  # Multi-turn: whether to use conversation history
+    conversation_id: str | None = None  
+    use_context: bool = True  
 
 
 @dataclass
 class ConversationTurn:
-    """Represents a single turn in conversation.
-    
-    Tracks: user question, generated SQL, execution results, and final answer
-    Used for building conversation history and providing context for follow-ups.
-    """
     turn_id: int
     user_question: str
     generated_sql: str | None
     execution_result: list[dict[str, Any]] | None
     answer: str
-    timestamp: float  # Unix timestamp
+    timestamp: float  
     intent_type: Literal["new_query", "clarification", "reference_previous"] = "new_query"
-    referenced_turn_ids: list[int] = field(default_factory=list)  # If references previous turns
+    referenced_turn_ids: list[int] = field(default_factory=list) 
 
 
-@dataclass
-class ConversationContext:
-    """Maintains conversation state and history.
-    
+"""Maintains conversation state and history.
     Strategy: Keep full history with bounded context window (last ~20 turns + ~2000 tokens)
     for LLM prompting. Oldest turns are summarized to prevent context explosion.
     """
+
+@dataclass
+class ConversationContext:
     conversation_id: str
     turns: list[ConversationTurn] = field(default_factory=list)
-    max_turns_in_context: int = 20  # How many recent turns to keep in context
-    max_tokens_for_context: int = 2000  # Max tokens for history in prompt
-    schema_fingerprint: str = ""  # Schema at conversation start
-    last_sql: str | None = None  # Most recent SQL for clarifications
-    last_result: list[dict[str, Any]] | None = None  # Most recent result cache
+    max_turns_in_context: int = 20  
+    max_tokens_for_context: int = 2000  
+    schema_fingerprint: str = ""  
+    last_sql: str | None = None  
+    last_result: list[dict[str, Any]] | None = None  
 
 
 @dataclass
 class IntentDetectionOutput:
-    """Determines what kind of response is needed for a follow-up question.
-    
-    Types:
-    - new_query: Generate completely new SQL (user asking different question)
-    - clarification: Refine previous query (user asking for more details on prev result)
-    - reference_previous: Use result from earlier turn (user asking "what about X?")
-    """
     intent_type: Literal["new_query", "clarification", "reference_previous"]
-    confidence: float  # 0.0-1.0
-    referenced_turn_id: int | None = None  # If referencing previous turn
-    reasoning: str = ""  # Why this intent was detected
-    suggested_context: str = ""  # Useful context from history for LLM prompt
+    confidence: float 
+    referenced_turn_id: int | None = None 
+    reasoning: str = ""  
+    suggested_context: str = "" 
 
 
 @dataclass
@@ -133,7 +109,6 @@ class PipelineOutput:
     total_llm_stats: dict[str, Any] = field(default_factory=dict)
 
 
-# ============ OBSERVABILITY / LOGGING ============
 
 _STANDARD_LOG_RECORD_ATTRS = {
     "name",
@@ -160,9 +135,8 @@ _STANDARD_LOG_RECORD_ATTRS = {
 }
 
 
-class JsonFormatter(logging.Formatter):
-    """Structured JSON logging with request correlation.
-    
+
+"""Structured JSON logging with request correlation.
     Why JSON logs instead of text?
     - Parseable: Can grep by request_id to trace single request end-to-end
     - Indexable: Can feed into ELK/Datadog for analytics
@@ -174,7 +148,10 @@ class JsonFormatter(logging.Formatter):
     
     Example: Found critical alias validation bug by tracing request_id
     and seeing exactly which stage failed.
-    """
+"""
+
+
+class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat().replace("+00:00", "Z")
         payload: dict[str, Any] = {
@@ -235,7 +212,6 @@ def safe_extra(**fields: Any) -> dict[str, Any]:
     return out
 
 
-# ============ FALLBACK SQL GENERATION ============
 
 def generate_fallback_sql(question: str, *, table_name: str) -> str | None:
     q = question.strip().lower()
@@ -246,7 +222,7 @@ def generate_fallback_sql(question: str, *, table_name: str) -> str | None:
     tn = f'"{table_name}"'
 
     if re.search(r"\b(delete|drop|update|insert|alter|create|truncate)\b", q):
-        return f"DELETE FROM {tn}"
+        return None 
 
     if ("younger" in q and "older" in q) and "addiction" in q:
         return (
@@ -359,7 +335,6 @@ def generate_fallback_sql(question: str, *, table_name: str) -> str | None:
     return None
 
 
-# ============ INTENT DETECTION FOR MULTI-TURN ============
 
 class IntentDetector:
     def __init__(self):
@@ -474,7 +449,6 @@ class IntentDetector:
         current_words = set(current.split())
         previous_words = set(previous.split())
         
-        # Remove common stop words
         stop_words = {"what", "show", "can", "you", "me", "the", "a", "is", "are", "in", "on", "for"}
         current_words -= stop_words
         previous_words -= stop_words
@@ -514,7 +488,6 @@ class ContextAwarePromptBuilder:
         
         base_prompt = f"""You are helping a user analyze gaming mental health data.
 
-Available tables and columns:
 {schema_context}
 
 Current question: {current_question}
@@ -545,7 +518,6 @@ Current question: {current_question}
         return "\n".join(lines)
 
 
-# ============ CONVERSATION CONTEXT MANAGEMENT ============
 
 class ContextManager:
     def __init__(self, max_turns: int = 20, max_context_tokens: int = 2000):
@@ -574,17 +546,6 @@ class ContextManager:
         intent_type: str = "new_query",
         referenced_turn_ids: Optional[list[int]] = None
     ) -> ConversationTurn:
-        """Add a new turn to conversation history.
-        
-        Args:
-            conversation_id: Conversation to add turn to
-            pipeline_output: Output from pipeline execution
-            intent_type: Type of query (new_query, clarification, reference_previous)
-            referenced_turn_ids: If referencing previous turns
-            
-        Returns:
-            The newly created ConversationTurn
-        """
         context = self.get_conversation(conversation_id)
         if not context:
             raise ValueError(f"Conversation {conversation_id} not found")

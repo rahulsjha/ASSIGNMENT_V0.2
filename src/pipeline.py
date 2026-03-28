@@ -12,6 +12,7 @@ from pathlib import Path
 from src.llm_client import OpenRouterLLMClient, build_default_llm_client
 from src.schema import SQLiteSchemaIntrospector, SchemaInfo
 from src.sql_validation import SQLValidator
+from src.semantic_validator import SemanticValidator
 from src.support import (
     get_logger,
     generate_fallback_sql,
@@ -479,11 +480,30 @@ class AnalyticsPipeline:
                         table_name=self.table_name,
                         allowed_columns=set(schema.columns),
                     )
+                else:
+                    # Fallback returned None (invalid or out-of-domain)
+                    sql_gen_output.sql = None
+                    sql = None
 
         if not validation_output.is_valid:
             sql = None
         else:
             sql = validation_output.validated_sql
+
+        # Stage 3b: Semantic Validation (check if SQL meaningfully answers the question)
+        # This must happen BEFORE execution so we can null out bad SQL
+        semantic_valid = True
+        semantic_error = None
+        if sql is not None and validation_output.is_valid:
+            semantic_valid, semantic_error = SemanticValidator.validate_semantic_match(
+                question, 
+                sql,
+                schema_columns=set(schema.columns),
+            )
+            if not semantic_valid:
+                sql = None
+                if not validation_output.error:
+                    validation_output.error = semantic_error or "Query does not meaningfully answer the question"
 
         # Stage 3: SQL Execution
         execution_output = self.executor.run(sql)
@@ -501,16 +521,26 @@ class AnalyticsPipeline:
             answer_output = self.llm.generate_answer(question, sql, rows)
 
         status = "success"
+        
         if destructive_intent:
             status = "invalid_sql"
-        elif sql_gen_output.sql is None and sql_gen_output.error:
-            status = "unanswerable"
+            if not validation_output.error:
+                validation_output.error = "Query contains destructive intent (DELETE, DROP, UPDATE, etc.)"
+        elif sql is None:
+            if semantic_error:
+                status = "unanswerable"
+            elif sql_gen_output.sql is None and sql_gen_output.error:
+                status = "unanswerable"
+            elif not validation_output.is_valid:
+                status = "invalid_sql"
+                if not validation_output.error:
+                    validation_output.error = "Query validation failed: unable to generate valid SQL"
+            else:
+                status = "unanswerable"
         elif not validation_output.is_valid:
             status = "invalid_sql"
         elif execution_output.error:
             status = "error"
-        elif sql is None:
-            status = "unanswerable"
 
         timings = {
             "sql_generation_ms": sql_gen_output.timing_ms,

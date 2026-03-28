@@ -42,7 +42,6 @@ class PublicPipelineTests(unittest.TestCase):
         self.assertIn(result.status, {"success", "unanswerable", "invalid_sql", "error"})
         self.assertEqual(result.question, expected_question)
 
-        # Internal eval expects strongly typed stage outputs.
         self.assertIsInstance(result.sql_generation, SQLGenerationOutput)
         self.assertIsInstance(result.sql_validation, SQLValidationOutput)
         self.assertIsInstance(result.sql_execution, SQLExecutionOutput)
